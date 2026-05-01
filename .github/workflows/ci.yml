@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep CMake / ninja caches in a fixed location for GHA caching
+  CMAKE_BUILD_PARALLEL_LEVEL: 4
+
+jobs:
+  # ── Build + Test (Debug + AddressSanitizer + UBSanitizer) ──────────────────
+  build-test-debug:
+    name: Build & Test (Debug / ASan+UBSan)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            cmake ninja-build \
+            clang-18 clang-tidy-18 clang-format-18 \
+            libssl-dev
+
+      - name: Cache CMake FetchContent
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: deps-${{ runner.os }}-
+
+      - name: Configure (Debug)
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DCMAKE_C_COMPILER=clang-18
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run unit tests
+        run: |
+          cd build
+          ctest --output-on-failure --parallel 4 -L unit
+
+      - name: Run integration tests
+        run: |
+          cd build
+          ctest --output-on-failure --parallel 4 -L integration
+
+  # ── Build (Release / optimized) ────────────────────────────────────────────
+  build-release:
+    name: Build (Release / -O3)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake ninja-build clang-18 libssl-dev
+
+      - name: Cache CMake FetchContent
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: deps-release-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: deps-release-${{ runner.os }}-
+
+      - name: Configure (Release)
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=clang++-18
+
+      - name: Build
+        run: cmake --build build --parallel
+
+  # ── Formatting check ───────────────────────────────────────────────────────
+  format-check:
+    name: clang-format check
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: sudo apt-get install -y clang-format-18
+
+      - name: Check formatting
+        run: |
+          find src include tests -name '*.cpp' -o -name '*.hpp' \
+            | xargs clang-format-18 --dry-run --Werror
+
+  # ── clang-tidy static analysis ─────────────────────────────────────────────
+  clang-tidy:
+    name: clang-tidy
+    runs-on: ubuntu-24.04
+    needs: build-test-debug  # reuse the compile_commands.json from debug build
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            cmake ninja-build \
+            clang-18 clang-tidy-18 \
+            libssl-dev
+
+      - name: Cache CMake FetchContent
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: deps-${{ runner.os }}-
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: Run clang-tidy
+        run: |
+          find src -name '*.cpp' \
+            | xargs clang-tidy-18 \
+                -p build \
+                --config-file=.clang-tidy \
+                --warnings-as-errors='*' \
+                2>&1 | tee clang-tidy-report.txt
+          if grep -q 'error:' clang-tidy-report.txt; then
+            echo "clang-tidy errors found"
+            exit 1
+          fi
+
+      - name: Upload clang-tidy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clang-tidy-report
+          path: clang-tidy-report.txt

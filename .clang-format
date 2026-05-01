@@ -1,0 +1,72 @@
+---
+# clang-format 17+ compatible
+# Style: LLVM with adjustments for readability at 100 columns
+Language:        Cpp
+BasedOnStyle:    LLVM
+
+# Column limit: 100 is a reasonable modern choice (wider than 80, narrower than 120)
+ColumnLimit:     100
+
+# Indentation
+IndentWidth:          2
+ContinuationIndentWidth: 4
+TabWidth:             2
+UseTab:               Never
+
+# Braces: Attach for control flow, break for functions/classes/namespaces
+BreakBeforeBraces:    Custom
+BraceWrapping:
+  AfterClass:         true
+  AfterControlStatement: false
+  AfterEnum:          true
+  AfterFunction:      true
+  AfterNamespace:     false
+  AfterStruct:        true
+  AfterUnion:         true
+  BeforeCatch:        false
+  BeforeElse:         false
+
+# Access modifiers
+AccessModifierOffset: -2
+
+# Alignment
+AlignAfterOpenBracket:         Align
+AlignConsecutiveAssignments:   false
+AlignConsecutiveDeclarations:  false
+AlignOperands:                 true
+AlignTrailingComments:         true
+
+# Allow short forms on single line
+AllowShortBlocksOnASingleLine:     Empty
+AllowShortFunctionsOnASingleLine:  Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine:      false
+
+# Includes
+IncludeBlocks:   Regroup
+IncludeCategories:
+  # Our own headers first
+  - Regex:    '^"(core|http|net|util|config)/'
+    Priority: 1
+  # Third-party
+  - Regex:    '^<(spdlog|gtest)/'
+    Priority: 2
+  # System/STL headers
+  - Regex:    '^<'
+    Priority: 3
+SortIncludes:    CaseSensitive
+
+# Pointer/reference alignment: left (int* p not int *p)
+DerivePointerAlignment: false
+PointerAlignment:        Left
+
+# Namespace
+NamespaceIndentation: None
+CompactNamespaces:    false
+
+# Penalties (tune line-breaking heuristics)
+PenaltyBreakBeforeFirstCallParameter: 100
+PenaltyReturnTypeOnItsOwnLine: 200
+
+# Modern C++
+Standard: Latest

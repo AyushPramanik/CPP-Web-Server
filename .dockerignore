@@ -1,0 +1,9 @@
+build/
+build-*/
+cmake-build-*/
+.git/
+.github/
+.cache/
+*.log
+logs/
+bench/results/
