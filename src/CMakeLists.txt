@@ -4,7 +4,9 @@ target_sources(cppws_core
     net/socket.cpp
     net/epoll.cpp
     net/buffer.cpp
+    net/connection.cpp
 )
+
 
 
 
