@@ -5,7 +5,9 @@ target_sources(cppws_core
     net/epoll.cpp
     net/buffer.cpp
     net/connection.cpp
+    core/event_loop.cpp
 )
+
 
 
 
