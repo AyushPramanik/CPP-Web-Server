@@ -1,70 +1,88 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// cppws — C++ Web Server
+// cppws — bootstrap sequence
 //
-// Bootstrap sequence mirrors production servers like NGINX:
-//   1. Parse config / CLI args
-//   2. Initialize logger (before any other subsystem logs)
-//   3. Initialize subsystems (event loop, thread pool, HTTP layer)
+// Signal handling strategy (mirrors NGINX's approach):
+//   • A raw pointer to the EventLoop is stored at file scope.
+//   • The signal handler calls loop->stop(), which only stores to an atomic —
+//     that's async-signal-safe (POSIX 7.1.4).
+//   • This is the same pattern NGINX uses via ngx_cycle global.
+//
+// Bootstrap order:
+//   1. Initialize logger
+//   2. Construct EventLoop (binds port, sets up epoll)
+//   3. Store loop pointer for signal handler
 //   4. Install signal handlers
-//   5. Enter event loop (blocks until shutdown signal)
-//   6. Graceful drain + cleanup
+//   5. Run event loop (blocks until stop())
+//   6. Graceful shutdown + logger flush
 // ─────────────────────────────────────────────────────────────────────────────
 
+#include "core/event_loop.hpp"
 #include "util/logger.hpp"
 
 #include <csignal>
 #include <cstdlib>
-#include <atomic>
 
 namespace {
 
-// std::atomic<bool> for signal-handler → main-thread communication.
-// Signal handlers must only call async-signal-safe functions; setting an
-// atomic flag is safe and avoids the pitfalls of longjmp-based approaches.
-std::atomic<bool> g_shutdown_requested{false};
+// Raw non-owning pointer — set before signals are installed, never written again.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+cppws::core::EventLoop* g_loop = nullptr;
 
 extern "C" void signal_handler(int signum) {
-  // Write to the atomic; main loop will check and break.
-  // We intentionally avoid logging here — spdlog is not async-signal-safe.
-  g_shutdown_requested.store(true, std::memory_order_relaxed);
+  // stop() sets an atomic bool — async-signal-safe.
+  if (g_loop != nullptr) {
+    g_loop->stop();
+  }
   (void)signum;
 }
 
+constexpr uint16_t DEFAULT_PORT = 8080;
+
 } // namespace
 
-int main(int argc, char* argv[]) {
-  // ── Logger init ─────────────────────────────────────────────────────────────
-  // Async mode: background writer thread so I/O threads never block on log I/O.
-  // Log file: empty → stdout only for now; Phase 1 config will add file paths.
+int main(int /*argc*/, char* /*argv*/[]) {
   cppws::util::Logger::init(cppws::util::Logger::Level::Debug, "", true);
+  LOG_INFO("cppws starting (v0.1.0) on port {}", DEFAULT_PORT);
 
-  LOG_INFO("cppws starting up (version {})", "0.1.0");
-  LOG_DEBUG("Build type: " CMAKE_BUILD_TYPE);
+  try {
+    cppws::core::EventLoop loop(DEFAULT_PORT);
 
-  // ── Signal handling ─────────────────────────────────────────────────────────
-  // SIGINT  → Ctrl-C during development
-  // SIGTERM → sent by systemd / Docker / Kubernetes when pod is evicted
-  // SIGHUP  → traditionally used for config reload (handled in Phase 6)
-  std::signal(SIGINT,  signal_handler);
-  std::signal(SIGTERM, signal_handler);
+    // Expose to signal handler before installing signals
+    g_loop = &loop;
 
-  LOG_INFO("Signal handlers installed (SIGINT, SIGTERM)");
+    std::signal(SIGINT,  signal_handler);
+    std::signal(SIGTERM, signal_handler);
 
-  // ── Placeholder event loop ──────────────────────────────────────────────────
-  // Phase 2 will replace this with the real epoll-based event loop.
-  // For now we just block until a signal arrives so we can verify the build.
-  LOG_INFO("Event loop placeholder — press Ctrl-C to exit");
+    // Placeholder HTTP handler — Phase 3 replaces this with real routing
+    loop.set_connection_handler([](cppws::net::ConnectionPtr conn) {
+      conn->set_read_callback([](cppws::net::Connection& c) {
+        if (!c.read_buf().empty()) {
+          static constexpr std::string_view RESPONSE =
+              "HTTP/1.1 200 OK\r\n"
+              "Content-Length: 13\r\n"
+              "Content-Type: text/plain\r\n"
+              "Connection: close\r\n"
+              "\r\n"
+              "Hello, World!";
+          c.enqueue_write(RESPONSE);
+          c.set_keep_alive(false);
+          c.flush_write();
+          c.read_buf().consume_all();
+        }
+      });
+    });
 
-  while (!g_shutdown_requested.load(std::memory_order_relaxed)) {
-    // In Phase 2 this becomes: event_loop.run_once(timeout_ms);
-    pause(); // suspend until any signal
+    loop.run(); // Blocks until signal_handler calls loop.stop()
+
+    g_loop = nullptr; // Clear before loop destructs
+
+  } catch (const std::exception& ex) {
+    LOG_CRITICAL("Fatal: {}", ex.what());
+    cppws::util::Logger::shutdown();
+    return EXIT_FAILURE;
   }
 
-  // ── Graceful shutdown ───────────────────────────────────────────────────────
-  LOG_INFO("Shutdown signal received — draining connections");
-  // Phase 2+: event_loop.stop(); thread_pool.drain_and_join();
   LOG_INFO("cppws stopped cleanly");
-
   cppws::util::Logger::shutdown();
   return EXIT_SUCCESS;
 }
