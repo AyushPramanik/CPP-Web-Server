@@ -1,5 +1,6 @@
 add_executable(unit_tests
   test_logger.cpp
+  test_buffer.cpp
 )
 
 target_link_libraries(unit_tests
