@@ -6,7 +6,10 @@ target_sources(cppws_core
     net/buffer.cpp
     net/connection.cpp
     core/event_loop.cpp
+    http/request.cpp
+    http/response.cpp
 )
+
 
 
 
