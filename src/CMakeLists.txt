@@ -8,7 +8,9 @@ target_sources(cppws_core
     core/event_loop.cpp
     http/request.cpp
     http/response.cpp
+    http/parser.cpp
 )
+
 
 
 
