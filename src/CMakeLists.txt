@@ -9,7 +9,10 @@ target_sources(cppws_core
     http/request.cpp
     http/response.cpp
     http/parser.cpp
+    http/mime.cpp
+    http/router.cpp
 )
+
 
 
 

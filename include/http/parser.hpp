@@ -41,10 +41,10 @@ class HttpParser {
 public:
   enum class Result : std::uint8_t { Incomplete, Complete, Error };
 
-  static constexpr std::size_t MAX_REQUEST_LINE = 8 * 1024;
-  static constexpr std::size_t MAX_HEADER_SIZE  = 8 * 1024;
-  static constexpr std::size_t MAX_HEADER_COUNT = 100;
-  static constexpr std::size_t MAX_BODY_SIZE    = 8 * 1024 * 1024; // 8 MiB
+  static constexpr std::size_t MAX_REQUEST_LINE = 8UL * 1024UL;
+  static constexpr std::size_t MAX_HEADER_SIZE  = 8UL * 1024UL;
+  static constexpr std::size_t MAX_HEADER_COUNT = 100UL;
+  static constexpr std::size_t MAX_BODY_SIZE    = 8UL * 1024UL * 1024UL;
 
   HttpParser() = default;
 
