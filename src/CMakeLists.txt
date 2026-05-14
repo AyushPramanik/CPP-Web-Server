@@ -11,7 +11,9 @@ target_sources(cppws_core
     http/parser.cpp
     http/mime.cpp
     http/router.cpp
+    http/static_handler.cpp
 )
+
 
 
 
