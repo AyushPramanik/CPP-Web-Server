@@ -3,94 +3,126 @@
 #include "util/logger.hpp"
 
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
 
 namespace cppws::core {
 
-EventLoop::EventLoop(uint16_t port)
+EventLoop::EventLoop(uint16_t port, std::size_t n_workers)
     : listen_socket_(net::Socket::make_tcp()),
-      epoll_(MAX_EVENTS) {
+      epoll_(MAX_EVENTS),
+      thread_pool_(n_workers) {
 
-  // SO_REUSEADDR: survive quick restarts (TIME_WAIT state)
-  // SO_REUSEPORT: allow future multi-loop workers to bind the same port
   listen_socket_.set_reuse_addr(true);
   listen_socket_.set_reuse_port(true);
   listen_socket_.bind(port);
   listen_socket_.listen();
-
-  // Register the listen socket for EPOLLIN | EPOLLET.
-  // No EPOLLOUT on the listen socket — we only accept() on it.
   epoll_.add(listen_socket_.fd(), EPOLLIN | EPOLLET);
 
-  LOG_INFO("EventLoop listening on port {}", port);
+  // eventfd: EFD_NONBLOCK so eventfd_read never blocks on the event loop thread.
+  // EFD_CLOEXEC: don't inherit across exec().
+  // The semaphore flag (EFD_SEMAPHORE) is NOT used — we read the entire counter
+  // at once to drain all pending wake signals in one syscall.
+  wakeup_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  if (wakeup_fd_ < 0) {
+    throw std::runtime_error("eventfd() failed");
+  }
+  epoll_.add(wakeup_fd_, EPOLLIN | EPOLLET);
+
+  LOG_INFO("EventLoop ready on port {} ({} workers)", port, thread_pool_.thread_count());
+}
+
+EventLoop::~EventLoop() {
+  if (wakeup_fd_ >= 0) {
+    ::close(wakeup_fd_);
+    wakeup_fd_ = -1;
+  }
+  thread_pool_.shutdown();
 }
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 void EventLoop::run() {
   running_.store(true, std::memory_order_relaxed);
-  LOG_INFO("EventLoop started, active_connections={}", connections_.size());
 
   while (running_.load(std::memory_order_relaxed)) {
-    // epoll_wait: block up to EPOLL_TIMEOUT_MS, then loop to check running_.
-    // The timeout prevents the loop from sleeping forever when stop() is called
-    // from a signal handler (which cannot write to the epoll fd).
     const auto events = epoll_.wait(EPOLL_TIMEOUT_MS);
 
-    for (const auto& ev : events) {
-      handle_event(ev);
+    for (const auto& event : events) {
+      handle_event(event);
     }
 
-    // Collect dead connections outside the event loop to avoid
-    // iterator invalidation during removal.
-    std::vector<int> to_remove;
+    // Reap dead connections outside the event loop
+    std::vector<int> dead;
     for (const auto& [fd, conn] : connections_) {
-      if (!conn->is_alive()) {
-        to_remove.push_back(fd);
-      }
+      if (!conn->is_alive()) dead.push_back(fd);
     }
-    for (int dead_fd : to_remove) {
-      remove_connection(dead_fd);
-    }
+    for (int dead_fd : dead) remove_connection(dead_fd);
   }
 
-  LOG_INFO("EventLoop stopped, draining {} connections", connections_.size());
+  LOG_INFO("EventLoop draining {} connections", connections_.size());
+  thread_pool_.shutdown();
   connections_.clear();
 }
 
-// ── Private helpers ───────────────────────────────────────────────────────────
+// ── Worker-facing API ─────────────────────────────────────────────────────────
+
+void EventLoop::post_response(net::ConnectionPtr conn, std::string data) {
+  // Called from worker threads — must be lock-safe.
+  // push() is thread-safe (mutex inside TaskQueue).
+  pending_writes_.push(PendingWrite{std::move(conn), std::move(data)});
+
+  // Signal the event loop to wake up from epoll_wait.
+  // Writing 1 increments the eventfd counter; epoll sees it as readable.
+  const uint64_t val = 1;
+  if (::write(wakeup_fd_, &val, sizeof(val)) < 0 && errno != EAGAIN) {
+    LOG_WARN("eventfd write failed: {}", std::strerror(errno));
+  }
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
 
 void EventLoop::accept_new_connections() {
-  // Edge-triggered: must loop accept() until EAGAIN.
-  // Under high connection rate, many connections may queue up between
-  // two epoll_wait calls — we must drain all of them.
   while (true) {
     net::Socket client = listen_socket_.accept();
-    if (!client.is_valid()) {
-      break; // EAGAIN — no more pending connections
-    }
+    if (!client.is_valid()) break;
 
-    const int client_fd = client.fd();
+    const int client_fd   = client.fd();
     const uint64_t conn_id = next_conn_id_++;
 
     auto conn = std::make_shared<net::Connection>(std::move(client), conn_id);
-
-    // Close callback: remove from our map when the connection dies
     conn->set_close_callback([this](net::Connection& c) {
       epoll_.remove(c.fd());
     });
 
     connections_.emplace(client_fd, conn);
-
-    // Register for EPOLLIN | EPOLLET | EPOLLRDHUP.
-    // EPOLLRDHUP: detect half-close without needing a failed read().
-    // Start with no EPOLLOUT — add it only when we have data to write.
     epoll_.add(client_fd, EPOLLIN | EPOLLET | EPOLLRDHUP);
 
-    LOG_DEBUG("Accepted connection [{}] fd={}", conn_id, client_fd);
-
-    // Notify the HTTP layer (or any higher-level handler)
     if (connection_handler_) {
       connection_handler_(conn);
+    }
+  }
+}
+
+void EventLoop::drain_pending_writes() {
+  // Drain the eventfd counter (read clears it atomically).
+  uint64_t count = 0;
+  if (::read(wakeup_fd_, &count, sizeof(count)) < 0 && errno != EAGAIN) {
+    LOG_WARN("eventfd read failed: {}", std::strerror(errno));
+  }
+
+  // Drain all pending writes from worker threads.
+  // try_pop() is non-blocking — stop when queue is empty.
+  while (auto pw = pending_writes_.try_pop()) {
+    auto& conn = pw->conn;
+    if (!conn || !conn->is_alive()) continue;
+
+    conn->enqueue_write(pw->data.data(), pw->data.size());
+    const std::size_t remaining = conn->flush_write();
+
+    if (remaining > 0) {
+      // Partial write: register EPOLLOUT so we can flush the rest later.
+      epoll_.modify(conn->fd(), EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP);
     }
   }
 }
@@ -101,9 +133,14 @@ void EventLoop::handle_event(const net::EpollEvent& event) {
     return;
   }
 
+  if (event.fd == wakeup_fd_) {
+    drain_pending_writes();
+    return;
+  }
+
   auto it = connections_.find(event.fd);
   if (it == connections_.end()) {
-    LOG_DEBUG("Event for unknown fd={}, ignoring", event.fd);
+    LOG_DEBUG("Stale event for fd={}", event.fd);
     return;
   }
 
@@ -115,14 +152,13 @@ void EventLoop::handle_event(const net::EpollEvent& event) {
   }
 
   if (event.is_readable()) {
-    if (!conn.on_readable()) {
-      return;
-    }
+    if (!conn.on_readable()) return;
   }
 
   if (event.is_writable()) {
     const std::size_t remaining = conn.flush_write();
     if (remaining == 0) {
+      // Write buffer drained — remove EPOLLOUT to stop spurious wakeups
       epoll_.modify(event.fd, EPOLLIN | EPOLLET | EPOLLRDHUP);
     }
   }
@@ -131,7 +167,6 @@ void EventLoop::handle_event(const net::EpollEvent& event) {
 void EventLoop::remove_connection(int conn_fd) {
   epoll_.remove(conn_fd);
   connections_.erase(conn_fd);
-  LOG_DEBUG("Removed connection fd={}, active={}", conn_fd, connections_.size());
 }
 
 } // namespace cppws::core

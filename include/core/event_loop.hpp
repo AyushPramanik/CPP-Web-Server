@@ -1,26 +1,38 @@
 #pragma once
 
 // ─────────────────────────────────────────────────────────────────────────────
-// EventLoop — epoll-based Reactor
+// EventLoop — epoll Reactor with integrated thread pool
 //
-// The Reactor pattern (defined by Schmidt, 1995) separates:
-//   1. Event demultiplexing — epoll_wait
-//   2. Event dispatching    — call the right handler per fd
-//   3. Request handling     — done by Connection / HTTP layer callbacks
+// Phase 4 additions:
+//   • ThreadPool: N worker threads execute HTTP handlers off the event loop.
+//   • eventfd (wakeup_fd_): workers signal the event loop when a response is
+//     ready without blocking on a mutex.
+//   • TaskQueue<PendingWrite> (pending_writes_): the MPSC channel from workers
+//     back to the event loop.  Only the event loop reads it; workers push to it.
 //
-// One EventLoop per thread. In Phase 4 we will run N event loops, one per
-// worker thread, each with its own epoll and its own connection set.
-// This is the "multi-reactor" or "one-loop-per-thread" model used by
-// Nginx (worker processes), libuv, and Netty.
+// Data flow:
 //
-// EventLoop responsibilities:
-//   • Accept new TCP connections on the listen socket
-//   • Register accepted connections with epoll
-//   • Dispatch readable/writable/close events to Connection objects
-//   • Remove dead connections from the connection map
-//   • Check the shutdown flag and exit cleanly
+//   accept()
+//     → Connection registered with epoll
+//     → on EPOLLIN: parser feeds data
+//     → on complete request: ThreadPool::submit(handler_task)
+//
+//   Worker thread:
+//     → run router.dispatch()
+//     → push PendingWrite to pending_writes_
+//     → eventfd_write(wakeup_fd_, 1)
+//
+//   Event loop (wakeup_fd_ readable):
+//     → eventfd_read(wakeup_fd_)   — drains the counter
+//     → drain pending_writes_      — pull all ready responses
+//     → conn->enqueue_write(data)
+//     → conn->flush_write()
+//     → if partial: epoll MOD to add EPOLLOUT
 // ─────────────────────────────────────────────────────────────────────────────
 
+#include "core/pending_write.hpp"
+#include "core/task_queue.hpp"
+#include "core/thread_pool.hpp"
 #include "net/connection.hpp"
 #include "net/epoll.hpp"
 #include "net/socket.hpp"
@@ -32,24 +44,18 @@
 
 namespace cppws::core {
 
-// ─────────────────────────────────────────────────────────────────────────────
-// EventLoop
-// ─────────────────────────────────────────────────────────────────────────────
 class EventLoop {
 public:
-  // Callback invoked for each accepted Connection (HTTP layer registers here)
   using ConnectionHandler = std::function<void(net::ConnectionPtr)>;
 
-  // epoll_wait timeout in milliseconds.
-  // 100ms: short enough to notice shutdown quickly, long enough to not spin.
   static constexpr int EPOLL_TIMEOUT_MS = 100;
+  static constexpr int MAX_EVENTS       = 1024;
 
-  // How many events to process per epoll_wait batch
-  static constexpr int MAX_EVENTS = 1024;
+  // port: TCP port to listen on.
+  // n_workers: thread pool size (0 = hardware_concurrency).
+  explicit EventLoop(uint16_t port, std::size_t n_workers = 0);
 
-  explicit EventLoop(uint16_t port);
-
-  ~EventLoop() = default;
+  ~EventLoop();
   EventLoop(const EventLoop&) = delete;
   EventLoop& operator=(const EventLoop&) = delete;
   EventLoop(EventLoop&&) = delete;
@@ -57,11 +63,7 @@ public:
 
   // ── Lifecycle ───────────────────────────────────────────────────────────────
 
-  // Enter the event loop. Blocks until stop() is called.
   void run();
-
-  // Signal the event loop to exit after the current iteration.
-  // Thread-safe (called from signal handler or another thread).
   void stop() noexcept { running_.store(false, std::memory_order_relaxed); }
 
   [[nodiscard]] bool is_running() const noexcept {
@@ -74,31 +76,38 @@ public:
     connection_handler_ = std::move(handler);
   }
 
-  // ── Stats (for /metrics endpoint in Phase 6) ────────────────────────────────
+  // ── Worker-facing API ────────────────────────────────────────────────────────
+
+  // Called by worker threads to post a completed response back to the loop.
+  // Thread-safe. Signals the event loop via eventfd.
+  void post_response(net::ConnectionPtr conn, std::string data);
+
+  // ── Stats ───────────────────────────────────────────────────────────────────
 
   [[nodiscard]] std::size_t active_connections() const noexcept {
     return connections_.size();
   }
-
   [[nodiscard]] uint64_t total_connections() const noexcept {
     return next_conn_id_;
   }
 
 private:
-  // ── Internal helpers ────────────────────────────────────────────────────────
-
   void accept_new_connections();
   void handle_event(const net::EpollEvent& event);
+  void drain_pending_writes();
   void remove_connection(int conn_fd);
-
-  // ── Members ─────────────────────────────────────────────────────────────────
 
   net::Socket listen_socket_;
   net::Epoll  epoll_;
+  int wakeup_fd_{-1}; // eventfd: workers write here to wake epoll_wait
 
-  // fd → Connection map. unordered_map gives O(1) lookup per event.
-  // In Phase 5 we may replace with an intrusive list for cache friendliness.
   std::unordered_map<int, net::ConnectionPtr> connections_;
+
+  // Pending writes from worker threads — only event loop reads, workers write.
+  // Using try_pop (non-blocking) in drain_pending_writes.
+  TaskQueue<PendingWrite> pending_writes_;
+
+  ThreadPool thread_pool_;
 
   std::atomic<bool> running_{false};
   uint64_t next_conn_id_{0};
