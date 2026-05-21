@@ -1,10 +1,12 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// cppws — bootstrap
+// cppws — bootstrap with thread pool dispatch
 //
-// HTTP pipeline per connection:
-//   recv bytes → feed parser → parse complete?
-//     yes → router.dispatch(req, resp) → resp.serialize() → enqueue_write
-//     no  → wait for more data (keep-alive preserves parser state)
+// HTTP pipeline (Phase 4):
+//   Event loop thread:  recv → parser.feed() → request complete?
+//     yes → ThreadPool::submit(task)        ← off the event loop thread
+//   Worker thread:      router.dispatch()   ← runs HTTP handler
+//     → EventLoop::post_response()          ← back to event loop via eventfd
+//   Event loop thread:  drain_pending_writes → conn.enqueue_write → flush
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "core/event_loop.hpp"
@@ -25,50 +27,38 @@ namespace {
 cppws::core::EventLoop* g_loop = nullptr;
 
 extern "C" void signal_handler(int /*signum*/) {
-  if (g_loop != nullptr) {
-    g_loop->stop();
-  }
+  if (g_loop != nullptr) g_loop->stop();
 }
 
-constexpr uint16_t DEFAULT_PORT = 8080;
+constexpr uint16_t DEFAULT_PORT    = 8080;
+constexpr std::size_t N_WORKERS    = 0; // 0 = hardware_concurrency
 
-// ── Per-connection HTTP state ─────────────────────────────────────────────────
-// Each Connection gets its own Parser instance (incremental, keeps state
-// across partial reads). We store it in a shared_ptr alongside the connection.
 struct HttpState {
   cppws::http::HttpParser parser{};
 };
 
-// Build the router with all application routes.
 cppws::http::Router build_router() {
   cppws::http::Router router;
 
-  // Health-check endpoint — useful for load balancer probes
   router.add_route(cppws::http::Method::GET, "/health",
-      [](const cppws::http::HttpRequest& /*req*/, cppws::http::HttpResponse& resp) {
+      [](const cppws::http::HttpRequest&, cppws::http::HttpResponse& resp) {
         resp.set_status(cppws::http::Status::Ok).set_body("ok");
       });
 
-  // Static files served from ./public/ (relative to CWD)
-  // In production this would be configured via a config file.
   const std::filesystem::path public_dir =
       std::filesystem::current_path() / "public";
+
   if (std::filesystem::exists(public_dir)) {
-    auto static_handler = std::make_shared<cppws::http::StaticFileHandler>(
-        public_dir, "/");
+    auto handler = std::make_shared<cppws::http::StaticFileHandler>(public_dir, "/");
     router.add_prefix_route(cppws::http::Method::GET, "/",
-        [static_handler](const cppws::http::HttpRequest& req,
-                         cppws::http::HttpResponse& resp) {
-          (*static_handler)(req, resp);
+        [handler](const cppws::http::HttpRequest& req, cppws::http::HttpResponse& resp) {
+          (*handler)(req, resp);
         });
   } else {
-    // Fallback if no public/ directory exists
     router.add_prefix_route(cppws::http::Method::GET, "/",
-        [](const cppws::http::HttpRequest& /*req*/,
-           cppws::http::HttpResponse& resp) {
-          resp.set_status(cppws::http::Status::Ok).set_body(
-              "cppws is running. Create a public/ directory to serve files.",
-              "text/plain");
+        [](const cppws::http::HttpRequest&, cppws::http::HttpResponse& resp) {
+          resp.set_status(cppws::http::Status::Ok)
+              .set_body("cppws running — create public/ to serve files");
         });
   }
 
@@ -79,39 +69,39 @@ cppws::http::Router build_router() {
 
 int main(int /*argc*/, char* /*argv*/[]) {
   cppws::util::Logger::init(cppws::util::Logger::Level::Info, "", true);
-  LOG_INFO("cppws starting (v0.1.0) on port {}", DEFAULT_PORT);
+  LOG_INFO("cppws v0.1.0 starting on port {}", DEFAULT_PORT);
 
   try {
-    cppws::core::EventLoop loop(DEFAULT_PORT);
+    cppws::core::EventLoop loop(DEFAULT_PORT, N_WORKERS);
     g_loop = &loop;
 
     std::signal(SIGINT,  signal_handler);
     std::signal(SIGTERM, signal_handler);
 
-    auto router = build_router();
+    // Router is shared (read-only after build) — safe to capture in lambdas
+    // accessed by multiple worker threads simultaneously.
+    auto router = std::make_shared<cppws::http::Router>(build_router());
 
-    // Install the HTTP pipeline as the connection handler.
-    // Each accepted connection gets a shared HttpState (parser per connection).
     loop.set_connection_handler(
-        [&router](cppws::net::ConnectionPtr conn) {
+        [&loop, router](cppws::net::ConnectionPtr conn) {
           auto state = std::make_shared<HttpState>();
 
           conn->set_read_callback(
-              [state, &router](cppws::net::Connection& c) {
-                // Feed all available bytes to the parser
+              [state, &loop, router, weak_conn = std::weak_ptr(conn)](
+                  cppws::net::Connection& c) {
+
                 const auto data = c.read_buf().readable();
                 const std::string_view sv{data.data(), data.size()};
                 const auto result = state->parser.feed(sv);
                 c.read_buf().consume_all();
 
                 if (result == cppws::http::HttpParser::Result::Error) {
-                  LOG_WARN("HTTP parse error on conn [{}]: {}",
-                           c.id(), state->parser.error());
+                  LOG_WARN("Parse error on conn [{}]: {}", c.id(), state->parser.error());
                   auto resp = cppws::http::HttpResponse::make_error(
                       cppws::http::Status::BadRequest, state->parser.error());
                   c.set_keep_alive(false);
-                  c.enqueue_write(resp.serialize());
-                  c.flush_write();
+                  // Error responses are tiny — send inline without dispatching
+                  loop.post_response(weak_conn.lock(), resp.serialize());
                   return;
                 }
 
@@ -119,19 +109,25 @@ int main(int /*argc*/, char* /*argv*/[]) {
                   auto req = state->parser.take_result();
                   state->parser.reset();
 
-                  cppws::http::HttpResponse resp;
-                  if (!router.dispatch(req, resp)) {
-                    resp = cppws::http::HttpResponse::make_error(
-                        cppws::http::Status::NotFound);
-                  }
-
-                  // Honour keep-alive from the request
                   const bool keep_alive = req.wants_keep_alive();
                   c.set_keep_alive(keep_alive);
-                  resp.set_header("connection", keep_alive ? "keep-alive" : "close");
 
-                  c.enqueue_write(resp.serialize());
-                  c.flush_write();
+                  // Capture what we need; move req into the task.
+                  // weak_ptr prevents the task from keeping the connection alive
+                  // past its natural lifetime.
+                  auto conn_ptr = weak_conn.lock();
+                  if (!conn_ptr) return;
+
+                  loop.submit(
+                      [router, req = std::move(req), conn_ptr, &loop, keep_alive]() mutable {
+                        cppws::http::HttpResponse resp;
+                        if (!router->dispatch(req, resp)) {
+                          resp = cppws::http::HttpResponse::make_error(
+                              cppws::http::Status::NotFound);
+                        }
+                        resp.set_header("connection", keep_alive ? "keep-alive" : "close");
+                        loop.post_response(conn_ptr, resp.serialize());
+                      });
                 }
               });
         });
@@ -145,7 +141,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
     return EXIT_FAILURE;
   }
 
-  LOG_INFO("cppws stopped cleanly");
+  LOG_INFO("cppws stopped");
   cppws::util::Logger::shutdown();
   return EXIT_SUCCESS;
 }

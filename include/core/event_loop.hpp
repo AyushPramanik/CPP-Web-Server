@@ -76,7 +76,10 @@ public:
     connection_handler_ = std::move(handler);
   }
 
-  // ── Worker-facing API ────────────────────────────────────────────────────────
+  // ── Task submission & worker-facing API ────────────────────────────────────
+
+  // Submit a task to the thread pool (called by read callbacks on event loop).
+  void submit(Task task) { thread_pool_.submit(std::move(task)); }
 
   // Called by worker threads to post a completed response back to the loop.
   // Thread-safe. Signals the event loop via eventfd.
