@@ -3,6 +3,8 @@ add_executable(unit_tests
   test_buffer.cpp
   test_http_parser.cpp
   test_http_response.cpp
+  test_task_queue.cpp
+  test_thread_pool.cpp
 )
 
 target_link_libraries(unit_tests
