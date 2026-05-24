@@ -126,7 +126,12 @@ int main(int /*argc*/, char* /*argv*/[]) {
                               cppws::http::Status::NotFound);
                         }
                         resp.set_header("connection", keep_alive ? "keep-alive" : "close");
-                        loop.post_response(conn_ptr, resp.serialize());
+
+                        // Extract sendfile fd before serialize() (which skips body
+                        // when sendfile is active, emitting headers only).
+                        const int file_fd   = resp.take_sendfile_fd();
+                        const auto file_sz  = static_cast<off_t>(resp.sendfile_size());
+                        loop.post_response(conn_ptr, resp.serialize(), file_fd, file_sz);
                       });
                 }
               });

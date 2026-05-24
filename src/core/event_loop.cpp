@@ -67,13 +67,11 @@ void EventLoop::run() {
 
 // ── Worker-facing API ─────────────────────────────────────────────────────────
 
-void EventLoop::post_response(net::ConnectionPtr conn, std::string data) {
-  // Called from worker threads — must be lock-safe.
-  // push() is thread-safe (mutex inside TaskQueue).
-  pending_writes_.push(PendingWrite{std::move(conn), std::move(data)});
+void EventLoop::post_response(net::ConnectionPtr conn, std::string data,
+                              int file_fd, off_t file_size) {
+  pending_writes_.push(
+      PendingWrite{std::move(conn), std::move(data), file_fd, file_size});
 
-  // Signal the event loop to wake up from epoll_wait.
-  // Writing 1 increments the eventfd counter; epoll sees it as readable.
   const uint64_t val = 1;
   if (::write(wakeup_fd_, &val, sizeof(val)) < 0 && errno != EAGAIN) {
     LOG_WARN("eventfd write failed: {}", std::strerror(errno));
@@ -115,13 +113,23 @@ void EventLoop::drain_pending_writes() {
   // try_pop() is non-blocking — stop when queue is empty.
   while (auto pw = pending_writes_.try_pop()) {
     auto& conn = pw->conn;
-    if (!conn || !conn->is_alive()) continue;
+    if (!conn || !conn->is_alive()) {
+      // Connection died before response was ready — close the file fd if any
+      if (pw->file_fd >= 0) ::close(pw->file_fd);
+      continue;
+    }
 
+    // Enqueue headers (always a buffer write)
     conn->enqueue_write(pw->data.data(), pw->data.size());
-    const std::size_t remaining = conn->flush_write();
 
+    // If sendfile: hand the file fd to the connection (it takes ownership)
+    if (pw->file_fd >= 0) {
+      conn->begin_sendfile(pw->file_fd, pw->file_size);
+      pw->file_fd = -1; // Connection now owns it
+    }
+
+    const std::size_t remaining = conn->flush_write();
     if (remaining > 0) {
-      // Partial write: register EPOLLOUT so we can flush the rest later.
       epoll_.modify(conn->fd(), EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP);
     }
   }

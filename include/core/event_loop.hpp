@@ -83,7 +83,11 @@ public:
 
   // Called by worker threads to post a completed response back to the loop.
   // Thread-safe. Signals the event loop via eventfd.
-  void post_response(net::ConnectionPtr conn, std::string data);
+  // file_fd = -1: data contains the full response (headers + body).
+  // file_fd >= 0: data contains headers only; body is sent via sendfile.
+  //               The event loop takes ownership of file_fd.
+  void post_response(net::ConnectionPtr conn, std::string data,
+                     int file_fd = -1, off_t file_size = 0);
 
   // ── Stats ───────────────────────────────────────────────────────────────────
 

@@ -11,6 +11,7 @@
 // we skip serialize() entirely and use sendfile() (Phase 5).
 // ─────────────────────────────────────────────────────────────────────────────
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -55,10 +56,34 @@ struct HttpResponse {
   // Automatically sets Content-Length if body is present and header is absent.
   [[nodiscard]] std::string serialize() const;
 
+  // ── Zero-copy sendfile support ──────────────────────────────────────────────
+
+  // Set a file descriptor as the response body source (Phase 5 optimization).
+  // The response owns file_fd — it will be closed after the transfer.
+  // serialize() generates headers only (no body) when has_sendfile() is true.
+  HttpResponse& set_sendfile(int file_fd, std::size_t file_size,
+                             std::string_view content_type);
+
+  [[nodiscard]] bool has_sendfile() const noexcept { return sendfile_fd_ >= 0; }
+  [[nodiscard]] int  sendfile_fd()   const noexcept { return sendfile_fd_; }
+  [[nodiscard]] std::size_t sendfile_size() const noexcept { return sendfile_size_; }
+
+  // Transfer fd ownership out — called by the dispatch layer.
+  // After this, has_sendfile() returns false.
+  [[nodiscard]] int take_sendfile_fd() noexcept {
+    const int saved = sendfile_fd_;
+    sendfile_fd_ = -1;
+    return saved;
+  }
+
   // ── Static factory helpers ──────────────────────────────────────────────────
 
   [[nodiscard]] static HttpResponse make_error(Status code, std::string_view detail = "");
   [[nodiscard]] static HttpResponse make_redirect(std::string_view location);
+
+private:
+  int sendfile_fd_{-1};
+  std::size_t sendfile_size_{0};
 };
 
 } // namespace cppws::http

@@ -63,16 +63,28 @@ std::string HttpResponse::serialize() const {
     out += "\r\n";
   }
 
-  // Auto content-length if body is present and header is absent
-  if (!body.empty() && !has_content_length) {
+  // Auto content-length for string bodies (sendfile sets it explicitly)
+  if (!body.empty() && !has_content_length && !has_sendfile()) {
     out += "content-length: ";
     out += std::to_string(body.size());
     out += "\r\n";
   }
 
   out += "\r\n";
-  out += body;
+  // Body is omitted when sendfile is active — the fd is sent separately
+  if (!has_sendfile()) {
+    out += body;
+  }
   return out;
+}
+
+HttpResponse& HttpResponse::set_sendfile(int file_fd, std::size_t file_size,
+                                         std::string_view content_type) {
+  sendfile_fd_   = file_fd;
+  sendfile_size_ = file_size;
+  headers["content-type"]   = std::string(content_type);
+  headers["content-length"] = std::to_string(file_size);
+  return *this;
 }
 
 HttpResponse HttpResponse::make_error(Status code, std::string_view detail) {

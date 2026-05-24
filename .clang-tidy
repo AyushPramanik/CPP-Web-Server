@@ -24,7 +24,8 @@ Checks: >
   -readability-named-parameter,
   portability-*,
   misc-*,
-  -misc-non-private-member-variables-in-classes
+  -misc-non-private-member-variables-in-classes,
+  -cppcoreguidelines-non-private-member-variables-in-classes
 
 # Treat warnings as errors in CI; keep as warnings locally
 WarningsAsErrors: ''

@@ -3,8 +3,8 @@
 #include "http/mime.hpp"
 #include "util/logger.hpp"
 
-#include <fstream>
-#include <iterator>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 namespace cppws::http {
 
@@ -46,29 +46,33 @@ void StaticFileHandler::operator()(const HttpRequest& req, HttpResponse& resp) c
 
 void StaticFileHandler::serve_file(const std::filesystem::path& abs_path,
                                    HttpResponse& resp) const {
-  // Read entire file into memory.
-  // Phase 5 will replace this with sendfile(2) for zero-copy.
-  std::ifstream file(abs_path, std::ios::binary);
-  if (!file) {
-    LOG_WARN("Failed to open file: {}", abs_path.string());
+  // Open the file for reading. O_RDONLY | O_CLOEXEC.
+  // sendfile(2) requires a file descriptor, not a FILE* — use open() directly.
+  const int file_fd = ::open(abs_path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (file_fd < 0) {
+    LOG_WARN("open({}) failed: {}", abs_path.string(), std::strerror(errno));
     resp = HttpResponse::make_error(Status::InternalServerError);
     return;
   }
 
-  std::string content(std::istreambuf_iterator<char>(file), {});
-  if (file.fail() && !file.eof()) {
-    resp = HttpResponse::make_error(Status::InternalServerError, "read error");
+  // Stat for file size — needed for Content-Length header before sendfile.
+  struct ::stat sb{};
+  if (::fstat(file_fd, &sb) < 0) {
+    ::close(file_fd);
+    resp = HttpResponse::make_error(Status::InternalServerError);
     return;
   }
+  const auto file_size = static_cast<std::size_t>(sb.st_size);
 
-  // Determine MIME type from extension
   const auto ext  = abs_path.extension().string();
   const auto mime = mime_type(ext);
 
-  LOG_DEBUG("Serving file: {} ({} bytes, {})", abs_path.string(), content.size(), mime);
+  LOG_DEBUG("Serving file via sendfile: {} ({} bytes, {})",
+            abs_path.string(), file_size, mime);
 
   resp.set_status(Status::Ok);
-  resp.set_body(std::move(content), mime);
+  // set_sendfile() takes ownership of file_fd — do not close it here.
+  resp.set_sendfile(file_fd, file_size, mime);
 }
 
 std::filesystem::path StaticFileHandler::resolve(std::string_view url_path) const {

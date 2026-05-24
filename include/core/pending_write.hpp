@@ -3,18 +3,16 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // PendingWrite — worker → event loop response delivery
 //
-// Workers produce HTTP responses as strings.  They cannot write directly to
-// the socket because:
-//   1. Only the event loop thread owns the epoll fd and the write-ready state.
-//   2. Concurrent writes from multiple threads require a mutex per socket,
-//      adding lock overhead on every response.
+// Carries either:
+//   A) headers + body string (small responses, error pages)
+//   B) headers string + file_fd/file_size for sendfile (static files)
 //
-// Instead: workers push a PendingWrite to a thread-safe queue, then write to
-// an eventfd.  The event loop wakes on the eventfd, drains the queue, and
-// performs the actual socket writes.
+// file_fd is -1 for case A. In case B the event loop calls:
+//   conn->enqueue_write(headers)
+//   conn->begin_sendfile(file_fd, file_size)
 //
-// This is the same "post back to the reactor" pattern used by libuv (uv_async)
-// and Boost.Asio (io_context::post()).
+// Ownership: file_fd is transferred to Connection::begin_sendfile which
+// wraps it in a SendfileOp RAII handle. The file_fd must NOT be closed here.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "net/connection.hpp"
@@ -24,8 +22,10 @@
 namespace cppws::core {
 
 struct PendingWrite {
-  net::ConnectionPtr conn{};  // target connection (shared_ptr keeps it alive)
-  std::string data{};         // serialized HTTP response
+  net::ConnectionPtr conn{};
+  std::string data{};     // serialized headers (+ body if file_fd == -1)
+  int file_fd{-1};        // -1 = body is in `data`; else use sendfile
+  off_t file_size{0};
 };
 
 } // namespace cppws::core
